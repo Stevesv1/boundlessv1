@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::{
     chain_monitor::ChainMonitorService,
-    config::{ConfigLock, OrderPricingPriority},
+    config::ConfigLock,
     db::DbObj,
     errors::CodedError,
     provers::{ProverError, ProverObj},
@@ -57,9 +57,6 @@ pub enum OrderPickerErr {
     #[error("{code} invalid request: {0}", code = self.code())]
     RequestError(#[from] RequestError),
 
-    #[error("{code} RPC error: {0:?}", code = self.code())]
-    RpcErr(anyhow::Error),
-
     #[error("{code} Unexpected error: {0:?}", code = self.code())]
     UnexpectedErr(#[from] anyhow::Error),
 }
@@ -71,7 +68,6 @@ impl CodedError for OrderPickerErr {
             OrderPickerErr::FetchImageErr(_) => "[B-OP-002]",
             OrderPickerErr::GuestPanic(_) => "[B-OP-003]",
             OrderPickerErr::RequestError(_) => "[B-OP-004]",
-            OrderPickerErr::RpcErr(_) => "[B-OP-005]",
             OrderPickerErr::UnexpectedErr(_) => "[B-OP-500]",
         }
     }
@@ -170,9 +166,9 @@ where
                     order.expire_timestamp = Some(expiry_secs);
 
                     tracing::info!(
-                        "Order {order_id} scheduled for lock attempt in {}s (timestamp: {}), when price threshold met",
-                        target_timestamp_secs.saturating_sub(now_timestamp()),
+                        "Setting order {order_id} to lock at {}, {} seconds from now",
                         target_timestamp_secs,
+                        target_timestamp_secs.saturating_sub(now_timestamp())
                     );
 
                     self.priced_orders_tx
@@ -453,16 +449,19 @@ where
 
         // Cap the exec limit based on the peak prove khz and the time until expiration.
         if let Some(peak_prove_khz) = peak_prove_khz {
-            let time_until_expiration = expiration.saturating_sub(now);
-            let deadline_cycle_limit =
-                calculate_max_cycles_for_time(peak_prove_khz, time_until_expiration);
+            let deadline_cycle_limit = {
+                let time_until_expiration = expiration.saturating_sub(now);
+
+                calculate_max_cycles_for_time(peak_prove_khz, time_until_expiration)
+            };
 
             if exec_limit_cycles > deadline_cycle_limit {
                 tracing::debug!(
-                    "Order {order_id} preflight cycle limit adjusted to {} cycles (capped by {:.1}s fulfillment deadline at {} peak_prove_khz config)",
+                    "Order {order_id}. Given peak_prove_khz {} and {} seconds until expiration, restricted exec limit from {} to {} cycles to ensure preflight terminates before expiration.",
+                    peak_prove_khz,
+                    expiration.saturating_sub(now),
                     exec_limit_cycles,
-                    time_until_expiration,
-                    peak_prove_khz
+                    deadline_cycle_limit
                 );
                 exec_limit_cycles = deadline_cycle_limit;
             }
@@ -474,7 +473,7 @@ where
         }
 
         tracing::debug!(
-            "Starting preflight execution of {order_id} with limit of {} cycles (~{} mcycles)",
+            "Starting preflight execution of {order_id} exec limit {} cycles (~{} mcycles)",
             exec_limit_cycles,
             exec_limit_cycles / 1_000_000
         );
@@ -580,22 +579,23 @@ where
         let order_id = order.id();
         let one_mill = U256::from(1_000_000);
 
-        let mcycle_price_min = U256::from(order.request.offer.minPrice)
+        let mcycle_price_min = (U256::from(order.request.offer.minPrice)
             .saturating_sub(order_gas_cost)
-            .saturating_mul(one_mill)
-            / U256::from(proof_res.stats.total_cycles);
-        let mcycle_price_max = U256::from(order.request.offer.maxPrice)
+            / U256::from(proof_res.stats.total_cycles))
+            * one_mill;
+        let mcycle_price_max = (U256::from(order.request.offer.maxPrice)
             .saturating_sub(order_gas_cost)
-            .saturating_mul(one_mill)
-            / U256::from(proof_res.stats.total_cycles);
+            / U256::from(proof_res.stats.total_cycles))
+            * one_mill;
 
         tracing::debug!(
-            "Order {order_id} price: {}-{} ETH, {}-{} ETH per mcycle, {} stake required, {} ETH gas cost",
+            "Order price: min: {} max: {} - cycles: {} - mcycle price: {} - {} - stake: {} gas_cost: {}",
             format_ether(U256::from(order.request.offer.minPrice)),
             format_ether(U256::from(order.request.offer.maxPrice)),
+            proof_res.stats.total_cycles,
             format_ether(mcycle_price_min),
             format_ether(mcycle_price_max),
-            format_units(U256::from(order.request.offer.lockStake), self.stake_token_decimals).unwrap_or_default(),
+            order.request.offer.lockStake,
             format_ether(order_gas_cost),
         );
 
@@ -612,20 +612,10 @@ where
             );
             0 // Schedule the lock ASAP
         } else {
-            let target_min_price = config_min_mcycle_price
-                .saturating_mul(U256::from(proof_res.stats.total_cycles))
-                .div_ceil(ONE_MILLION)
-                + order_gas_cost;
             tracing::debug!(
-                "Order {order_id} minimum profitable price: {} ETH",
-                format_ether(target_min_price)
+                "LFG"
             );
-
-            order
-                .request
-                .offer
-                .time_at_price(target_min_price)
-                .context("Failed to get target price timestamp")?
+            0
         };
 
         let expiry_secs = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
@@ -707,12 +697,12 @@ where
     /// Return available gas balance.
     ///
     /// This is defined as the balance of the signer account.
-    async fn available_gas_balance(&self) -> Result<U256, OrderPickerErr> {
+    async fn available_gas_balance(&self) -> Result<U256> {
         let balance = self
             .provider
             .get_balance(self.provider.default_signer_address())
             .await
-            .map_err(|err| OrderPickerErr::RpcErr(err.into()))?;
+            .context("Failed to get current wallet balance")?;
 
         let gas_balance_reserved = self.gas_balance_reserved().await?;
 
@@ -747,18 +737,14 @@ where
         Box::pin(async move {
             tracing::info!("Starting order picking monitor");
 
-            let read_config = || -> Result<(usize, OrderPricingPriority), Self::Error> {
+            let read_capacity = || -> Result<usize, Self::Error> {
                 let cfg = picker.config.lock_all().map_err(|err| {
                     OrderPickerErr::UnexpectedErr(anyhow::anyhow!("Failed to read config: {err}"))
                 })?;
-                Ok((
-                    cfg.market.max_concurrent_preflights as usize,
-                    cfg.market.order_pricing_priority,
-                ))
+                Ok(cfg.market.max_concurrent_preflights as usize)
             };
 
-            let (mut current_capacity, mut priority_mode) =
-                read_config().map_err(SupervisorErr::Fault)?;
+            let mut current_capacity = read_capacity().map_err(SupervisorErr::Fault)?;
             let mut tasks: JoinSet<()> = JoinSet::new();
             let mut rx = picker.new_order_rx.lock().await;
             let mut capacity_check_interval = tokio::time::interval(MIN_CAPACITY_CHECK_INTERVAL);
@@ -776,14 +762,10 @@ where
                     }
                     _ = capacity_check_interval.tick() => {
                         // Check capacity on an interval for capacity changes in config
-                        let (new_capacity, new_priority_mode) = read_config().map_err(SupervisorErr::Fault)?;
-                        if new_capacity != current_capacity{
+                        let new_capacity = read_capacity().map_err(SupervisorErr::Fault)?;
+                        if new_capacity != current_capacity {
                             tracing::debug!("Pricing capacity changed from {} to {}", current_capacity, new_capacity);
                             current_capacity = new_capacity;
-                        }
-                        if new_priority_mode != priority_mode {
-                            tracing::debug!("Order pricing priority changed from {:?} to {:?}", priority_mode, new_priority_mode);
-                            priority_mode = new_priority_mode;
                         }
                     }
                     _ = cancel_token.cancelled() => {
@@ -797,15 +779,19 @@ where
 
                 // Process pending orders if we have capacity
                 while !pending_orders.is_empty() && tasks.len() < current_capacity {
-                    if let Some(order) =
-                        picker.select_next_pricing_order(&mut pending_orders, priority_mode)
-                    {
+                    if let Some(order) = pending_orders.pop_front() {
                         let picker_clone = picker.clone();
                         let task_cancel_token = cancel_token.child_token();
                         tasks.spawn(async move {
-                            picker_clone
+                            let order_id = order.id();
+                            let result = picker_clone
                                 .price_order_and_update_state(order, task_cancel_token)
                                 .await;
+                            if result {
+                                tracing::debug!("Finished processing order: {}", order_id);
+                            } else {
+                                tracing::debug!("Order was not processed: {}", order_id);
+                            }
                         });
                     }
                 }
@@ -822,7 +808,7 @@ fn calculate_max_cycles_for_time(prove_khz: u64, time_seconds: u64) -> u64 {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::time::Duration;
 
     use super::*;
@@ -851,9 +837,9 @@ pub(crate) mod tests {
     use tracing_test::traced_test;
 
     /// Reusable context for testing the order picker
-    pub(crate) struct PickerTestCtx<P> {
+    struct TestCtx<P> {
         anvil: AnvilInstance,
-        pub(crate) picker: OrderPicker<P>,
+        picker: OrderPicker<P>,
         boundless_market: BoundlessMarketService<Arc<P>>,
         storage_provider: MockStorageProvider,
         db: DbObj,
@@ -863,15 +849,15 @@ pub(crate) mod tests {
     }
 
     /// Parameters for the generate_next_order function.
-    pub(crate) struct OrderParams {
-        pub(crate) order_index: u32,
-        pub(crate) min_price: U256,
-        pub(crate) max_price: U256,
-        pub(crate) lock_stake: U256,
-        pub(crate) fulfillment_type: FulfillmentType,
-        pub(crate) bidding_start: u64,
-        pub(crate) lock_timeout: u32,
-        pub(crate) timeout: u32,
+    struct OrderParams {
+        order_index: u32,
+        min_price: U256,
+        max_price: U256,
+        lock_stake: U256,
+        fulfillment_type: FulfillmentType,
+        bidding_start: u64,
+        lock_timeout: u32,
+        timeout: u32,
     }
 
     impl Default for OrderParams {
@@ -889,15 +875,15 @@ pub(crate) mod tests {
         }
     }
 
-    impl<P> PickerTestCtx<P>
+    impl<P> TestCtx<P>
     where
         P: Provider + WalletProvider,
     {
-        pub(crate) fn signer(&self, index: usize) -> PrivateKeySigner {
+        fn signer(&self, index: usize) -> PrivateKeySigner {
             self.anvil.keys()[index].clone().into()
         }
 
-        pub(crate) async fn generate_next_order(&self, params: OrderParams) -> Box<OrderRequest> {
+        async fn generate_next_order(&self, params: OrderParams) -> Box<OrderRequest> {
             let image_url = self.storage_provider.upload_program(ECHO_ELF).await.unwrap();
             let image_id = Digest::from(ECHO_ID);
             let chain_id = self.provider.get_chain_id().await.unwrap();
@@ -942,30 +928,28 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
-    pub(crate) struct PickerTestCtxBuilder {
+    struct TestCtxBuilder {
         initial_signer_eth: Option<i32>,
         initial_hp: Option<U256>,
         config: Option<ConfigLock>,
         stake_token_decimals: Option<u8>,
     }
 
-    impl PickerTestCtxBuilder {
-        pub(crate) fn with_initial_signer_eth(self, eth: i32) -> Self {
+    impl TestCtxBuilder {
+        fn with_initial_signer_eth(self, eth: i32) -> Self {
             Self { initial_signer_eth: Some(eth), ..self }
         }
-        pub(crate) fn with_initial_hp(self, hp: U256) -> Self {
+        fn with_initial_hp(self, hp: U256) -> Self {
             assert!(hp < U256::from(U96::MAX), "Cannot have more than 2^96 hit points");
             Self { initial_hp: Some(hp), ..self }
         }
-        pub(crate) fn with_config(self, config: ConfigLock) -> Self {
+        fn with_config(self, config: ConfigLock) -> Self {
             Self { config: Some(config), ..self }
         }
-        pub(crate) fn with_stake_token_decimals(self, decimals: u8) -> Self {
+        fn with_stake_token_decimals(self, decimals: u8) -> Self {
             Self { stake_token_decimals: Some(decimals), ..self }
         }
-        pub(crate) async fn build(
-            self,
-        ) -> PickerTestCtx<impl Provider + WalletProvider + Clone + 'static> {
+        async fn build(self) -> TestCtx<impl Provider + WalletProvider + Clone + 'static> {
             let anvil = Anvil::new()
                 .args(["--balance", &format!("{}", self.initial_signer_eth.unwrap_or(10000))])
                 .spawn();
@@ -1035,7 +1019,7 @@ pub(crate) mod tests {
                 self.stake_token_decimals.unwrap_or(6),
             );
 
-            PickerTestCtx {
+            TestCtx {
                 anvil,
                 picker,
                 boundless_market,
@@ -1055,7 +1039,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let mut ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let order = ctx.generate_next_order(Default::default()).await;
 
@@ -1076,7 +1060,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let mut order = ctx.generate_next_order(Default::default()).await;
         // set a bad predicate
@@ -1103,7 +1087,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let mut order = ctx.generate_next_order(Default::default()).await;
 
@@ -1130,7 +1114,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let order = ctx
             .generate_next_order(OrderParams {
@@ -1160,7 +1144,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let mut ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         // NOTE: Values currently adjusted ad hoc to be between the two thresholds.
         let min_price = parse_ether("0.0013").unwrap();
@@ -1217,7 +1201,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let mut ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         // NOTE: Values currently adjusted ad hoc to be between the two thresholds.
         let min_price = parse_ether("0.0013").unwrap();
@@ -1277,7 +1261,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let mut ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         // NOTE: Values currently adjusted ad hoc to be between the two thresholds.
         let min_price = parse_ether("0.0013").unwrap();
@@ -1336,7 +1320,7 @@ pub(crate) mod tests {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
             config.load_write().unwrap().market.allow_client_addresses = Some(vec![Address::ZERO]);
         }
-        let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let order = ctx.generate_next_order(Default::default()).await;
 
@@ -1360,7 +1344,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
         }
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let mut ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let order = ctx.generate_next_order(Default::default()).await;
         let order_id = order.id();
@@ -1409,7 +1393,7 @@ pub(crate) mod tests {
             config.load_write().unwrap().market.max_stake = "10".into();
         }
 
-        let mut ctx = PickerTestCtxBuilder::default()
+        let mut ctx = TestCtxBuilder::default()
             .with_initial_signer_eth(signer_inital_balance_eth)
             .with_initial_hp(lockin_stake)
             .with_config(config)
@@ -1464,7 +1448,7 @@ pub(crate) mod tests {
             config.load_write().unwrap().market.fulfill_gas_estimate = fulfill_gas;
         }
 
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let mut ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let order = ctx.generate_next_order(Default::default()).await;
         let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
@@ -1499,11 +1483,8 @@ pub(crate) mod tests {
         }
         let lock_stake = U256::from(10);
 
-        let ctx = PickerTestCtxBuilder::default()
-            .with_config(config)
-            .with_initial_hp(lock_stake)
-            .build()
-            .await;
+        let ctx =
+            TestCtxBuilder::default().with_config(config).with_initial_hp(lock_stake).build().await;
         let order = ctx.generate_next_order(OrderParams { lock_stake, ..Default::default() }).await;
 
         let order_id = order.id();
@@ -1524,7 +1505,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price_stake_token = "0.0000001".into();
         }
-        let mut ctx = PickerTestCtxBuilder::default()
+        let mut ctx = TestCtxBuilder::default()
             .with_config(config)
             .with_initial_hp(U256::from(1000))
             .build()
@@ -1567,7 +1548,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price_stake_token = "0.1".into();
         }
-        let ctx = PickerTestCtxBuilder::default()
+        let ctx = TestCtxBuilder::default()
             .with_stake_token_decimals(6)
             .with_config(config)
             .build()
@@ -1610,7 +1591,7 @@ pub(crate) mod tests {
             config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
             config.load_write().unwrap().market.max_mcycle_limit = Some(exec_limit);
         }
-        let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         ctx.picker.config.load_write().as_mut().unwrap().market.allow_skip_mcycle_limit_addresses =
             Some(vec![ctx.provider.default_signer_address()]);
@@ -1654,7 +1635,7 @@ pub(crate) mod tests {
             config.load_write().unwrap().market.peak_prove_khz = Some(1);
             config.load_write().unwrap().market.min_deadline = 10;
         }
-        let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+        let ctx = TestCtxBuilder::default().with_config(config).build().await;
 
         let order = ctx
             .generate_next_order(OrderParams {
@@ -1674,10 +1655,10 @@ pub(crate) mod tests {
         let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
         assert!(locked);
 
-        let expected_log_pattern = format!("Order {order_id} preflight cycle limit adjusted to");
+        let expected_log_pattern = format!("Order {order_id}. Given peak_prove_khz");
         assert!(logs_contain(&expected_log_pattern));
-        assert!(logs_contain("capped by"));
-        assert!(logs_contain("peak_prove_khz config"));
+        assert!(logs_contain("restricted exec limit from"));
+        assert!(logs_contain("to 150000 cycles to ensure preflight terminates"));
     }
 
     #[tokio::test]
@@ -1689,7 +1670,7 @@ pub(crate) mod tests {
             cfg.market.mcycle_price = "0.0000001".into();
             cfg.market.max_concurrent_preflights = 2;
         }
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config.clone()).build().await;
+        let mut ctx = TestCtxBuilder::default().with_config(config.clone()).build().await;
 
         // Start the order picker task
         let picker_task = tokio::spawn(ctx.picker.spawn(Default::default()));
@@ -1735,7 +1716,7 @@ pub(crate) mod tests {
         {
             config.load_write().unwrap().market.mcycle_price_stake_token = "1".into();
         }
-        let ctx = PickerTestCtxBuilder::default()
+        let ctx = TestCtxBuilder::default()
             .with_config(config.clone())
             .with_stake_token_decimals(6)
             .build()
